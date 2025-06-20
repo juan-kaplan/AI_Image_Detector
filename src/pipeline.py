@@ -1,8 +1,4 @@
 from src.utils.files import create_result_folder
-from src.models import ensamble
-from src.models import NN_pytorch
-from src.models import resNeXt_ft
-from src.models import resNeXt_weighted_avg
 from src.models import resnext_real_vs_ai
 # from src.models import mcf_features_nn
 import pandas as pd
@@ -42,28 +38,13 @@ def load_model(model_params):
     object: Loaded machine learning model instance corresponding to the specified model_name.
     """
 
-    names_classes = get_class_names(model_params['classes_csv'], column='season')
 
     model_name = model_params['model_name']
     model = None
     
-    if model_name == 'ensamble':
-        model = ensamble.EnhancedSeasonalColorModel()
-
-    elif model_name == 'nn_pytorch':
-        model = NN_pytorch.NNSeasonalColorModel()
-    
-    elif model_name == 'resNeXt_ft':
-        model = resNeXt_ft.ResNeXt_FT(model_params['variant'])
-
-    elif model_name == 'resNeXt_weighted_avg':
-        if 'variant' in model_params:
-            model = resNeXt_weighted_avg.ResNeXtWeightedClassifier(variant=model_params['variant'], num_classes=len(names_classes))
-        else:
-            model = resNeXt_weighted_avg.ResNeXtWeightedClassifier(num_classes=len(names_classes))
-    elif model_name == 'resnext_real_vs_ai':
+    if model_name == 'resnext_real_vs_ai':
         model = resnext_real_vs_ai.ResNeXtRealVsAITrainer(model_params)
-    return model, names_classes
+    return model, ['real', 'fake']
 
 
 def run_model(model_params, data_params):

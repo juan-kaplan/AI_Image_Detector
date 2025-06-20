@@ -13,8 +13,8 @@ from PIL import Image
 class ImageCSVDataset(Dataset):
     def __init__(self, classes, csv_path, img_dir=None, transform=None):
         self.df = pd.read_csv(csv_path)
-        if "image_path" not in self.df.columns or "label" not in self.df.columns:
-            raise ValueError("El CSV debe tener columnas 'image_path' y 'label'.")
+        if "filepath" not in self.df.columns or "label" not in self.df.columns:
+            raise ValueError("El CSV debe tener columnas 'filepath' y 'label'.")
         self.img_dir = img_dir or ""
         self.transform = transform
         self.label_map = {cls: idx for idx, cls in enumerate(classes)}
@@ -25,9 +25,9 @@ class ImageCSVDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         path = (
-            os.path.join(self.img_dir, row["image_path"])
-            if self.img_dir and not os.path.isabs(row["image_path"])
-            else row["image_path"]
+            os.path.join(self.img_dir, row["filepath"])
+            if self.img_dir and not os.path.isabs(row["filepath"])
+            else row["filepath"]
         )
         image = Image.open(path).convert("RGB")
         label = self.label_map[row["label"]]

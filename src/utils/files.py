@@ -47,8 +47,6 @@ def create_result_folder(model_params, data_params):
     tuple: A tuple containing the main path where results will be stored and the path for cross-validation results (if cv=True).
     """
     path = ('results/' + model_params['model_name'] + '/' + 
-            data_params['dataset_name'] + '/' +
-            data_params['type_features'] + '/' +
             model_params['configs_file_name'])
 
     os.makedirs(path, exist_ok=True)

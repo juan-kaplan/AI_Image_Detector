@@ -11,25 +11,24 @@ def create_stratified_splits(
     real_images_dir: str,
     generators_txt: str,
     output_dir: str,
-    holdout_generators=None,         # list of 3 generators, or None ⇒ pick
-    test_size: float = 0.15,         # fraction of TOTAL images we want in test
+    holdout_generators=None,    # list of generators to exclude from training
+    test_size: float = 0.20,     # fraction of TOTAL images to go into the test set
     random_state: int = 42
 ):
     """
     Create train / val / test CSVs with columns: filepath,label,generator
 
-    • Every image whose generator is in *holdout_generators* → test
-    • If that is < `test_size` of all data, add stratified extra fake images
-    • Same number of real images is sampled for test (or all that exist)
-    • Remaining fakes: 80 % train, 20 % val (stratified by generator)
-    • Remaining reals: 80 % train, 20 % val (random)
+    • Splits the full dataset into 80% train+val and 20% test.
+    • From the train+val pool, splits 80% train and 20% val.
+    • Any image whose generator is in holdout_generators is prevented from entering the train set.
+      (They may appear in val or test, depending on random split.)
     """
 
     rng = np.random.default_rng(random_state)
 
-    # ─────────────────────────────────── 1. read mapping
+    # ─────────────────────────────────── 1. read mapping of fake images to generators
     fake_image_to_gen = {}
-    with open(generators_txt) as f:
+    with open(generators_txt, 'r') as f:
         for line in f:
             img, gen = line.strip().split()[:2]
             fake_image_to_gen[img] = gen
@@ -38,7 +37,7 @@ def create_stratified_splits(
     fake_df = pd.DataFrame([
         dict(filepath=str(Path(fake_images_dir) / fn),
              label="fake",
-             generator=fake_image_to_gen[fn])
+             generator=fake_image_to_gen.get(fn, "unknown"))
         for fn in os.listdir(fake_images_dir) if fn.endswith(".png")
     ])
 
@@ -50,68 +49,41 @@ def create_stratified_splits(
         if fn.lower().endswith((".jpg", ".jpeg", ".png"))
     ])
 
-    # ─────────────────────────────────── 3. select hold-out generators
-    all_gens = sorted(fake_df["generator"].unique())
-    if holdout_generators is None:
-        holdout_generators = rng.choice(all_gens, size=3, replace=False).tolist()
+    # ─────────────────────────────────── 3. combine
+    all_df = pd.concat([fake_df, real_df], ignore_index=True)
+
+    # ─────────────────────────────────── 4. separate holdout vs rest
+    if holdout_generators:
+        mask_hold = all_df["generator"].isin(holdout_generators)
+        holdout_df = all_df[mask_hold].copy()
+        rest_df    = all_df[~mask_hold].copy()
     else:
-        if len(holdout_generators) != 3:
-            raise ValueError("Exactly three hold-out generators are required.")
-        unknown = set(holdout_generators) - set(all_gens)
-        if unknown:
-            raise ValueError(f"Unknown generators: {', '.join(unknown)}")
+        holdout_df = pd.DataFrame(columns=all_df.columns)
+        rest_df    = all_df.copy()
 
-    # ─────────────────────────────────── 4. build initial test split
-    fake_test_df = fake_df[fake_df["generator"].isin(holdout_generators)].copy()
-    fake_rem_df  = fake_df[~fake_df["generator"].isin(holdout_generators)].copy()
+    total_images    = len(all_df)
+    desired_test_sz = int(round(test_size * total_images))
 
-    total_images     = len(fake_df) + len(real_df)
-    desired_test_sz  = int(round(test_size * total_images))
+    # ─────────────────────────────────── 5. build test set
+    #   include all holdout images, plus a random sample from rest to reach desired size
+    n_rest_needed = max(0, min(len(rest_df), desired_test_sz - len(holdout_df)))
+    rest_test_df = rest_df.sample(n=n_rest_needed, random_state=random_state)
+    test_df = pd.concat([holdout_df, rest_test_df], ignore_index=True) \
+                .sample(frac=1, random_state=random_state) \
+                .reset_index(drop=True)
 
-    # helper: stratified sample of extra fakes if test is too small
-    def _add_extra_fake(num_needed):
-        if num_needed <= 0:
-            return pd.DataFrame(columns=fake_df.columns)
-        frac = num_needed / len(fake_rem_df)
-        extra, remainder = train_test_split(
-            fake_rem_df,
-            test_size=frac,
-            stratify=fake_rem_df["generator"],
-            random_state=random_state,
-        )
-        fake_rem_df[:] = remainder  # mutate outer variable
-        return extra
+    # ─────────────────────────────────── 6. build train+val pool
+    train_val_df = rest_df.drop(index=rest_test_df.index)
 
-    shortfall = desired_test_sz - len(fake_test_df)
-    if shortfall > 0:
-        fake_test_df = pd.concat([fake_test_df, _add_extra_fake(shortfall // 2)])
-
-    # ─────────────────────────────────── 5. match real images in test
-    real_test_sz = min(len(real_df), len(fake_test_df))
-    real_test_df, real_rem_df = train_test_split(
-        real_df, test_size=real_test_sz, random_state=random_state, shuffle=True
-    )
-
-    # ─────────────────────────────────── 6. 80 % / 20 % split of leftovers
-    fake_train_df, fake_val_df = train_test_split(
-        fake_rem_df,
-        test_size=0.20,
-        stratify=fake_rem_df["generator"],
-        random_state=random_state,
-    )
-    real_train_df, real_val_df = train_test_split(
-        real_rem_df,
+    # ─────────────────────────────────── 7. split train+val into train / val (80% / 20%)
+    train_df, val_df = train_test_split(
+        train_val_df,
         test_size=0.20,
         random_state=random_state,
+        shuffle=True
     )
-
-    # ─────────────────────────────────── 7. combine + shuffle
-    train_df = pd.concat([fake_train_df, real_train_df]).sample(
-        frac=1, random_state=random_state).reset_index(drop=True)
-    val_df   = pd.concat([fake_val_df,   real_val_df]).sample(
-        frac=1, random_state=random_state).reset_index(drop=True)
-    test_df  = pd.concat([fake_test_df,  real_test_df]).sample(
-        frac=1, random_state=random_state).reset_index(drop=True)
+    train_df = train_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    val_df   = val_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
 
     # ─────────────────────────────────── 8. write CSVs
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -140,3 +112,4 @@ create_stratified_splits(
     test_size=0.15,
     random_state=17
 )
+
