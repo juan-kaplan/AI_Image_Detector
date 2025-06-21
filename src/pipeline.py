@@ -92,7 +92,17 @@ def run_model(model_params, data_params):
 def test_model(model_params, model_path, test_dataset_path, seasons_only=False, topk=None):
     model, names = load_model(model_params)
     if isinstance(model, resnext_real_vs_ai.ResNeXtRealVsAITrainer):
-        # TODO: implement test logic for ResNeXtRealVsAITrainer
+        # Prepare dataloader using the new method
+        test_loader = model.create_dataloader(
+            names,
+            test_dataset_path,
+            batch_size=model.batch_size_va,
+            num_workers=model.num_workers,
+            test=True,
+            shuffle=False
+        )
+        model.load_weights(model_path)
+        model.evaluate(test_loader)
         pass
     else:
         model.load_params_model(model_path, names)

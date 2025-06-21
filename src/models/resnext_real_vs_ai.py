@@ -8,6 +8,7 @@ from torchvision import transforms
 import os
 import pandas as pd
 from PIL import Image
+from sklearn.metrics import classification_report
 
 
 class ImageCSVDataset(Dataset):
@@ -76,7 +77,7 @@ class ResNeXtRealVsAITrainer:
             self.lr_head          = model_params.get("lr_head",          self.lr_head)
             self.weight_decay     = model_params.get("weight_decay",     self.weight_decay)
             self.num_epochs       = model_params.get("num_epochs",       self.num_epochs)
-            self.patience         = model_params.get("patience",         self.patience)
+            self.patience         = model_params.get("early_stopping_patience",         self.patience)
 
             self.batch_size_tr    = model_params.get("batch_size_tr",    self.batch_size_tr)
             self.batch_size_va    = model_params.get("batch_size_va",    self.batch_size_va)
@@ -169,6 +170,7 @@ class ResNeXtRealVsAITrainer:
     def fit(self, train_loader, val_loader=None, save_name=None):
         best_val_acc = -float("inf")
         patience_cnt = 0
+        prev_best_path = None
         for epoch in range(self.num_epochs):
             train_loss = self._train_one_epoch(train_loader)
             val_loss, val_acc = 0.0, 0.0
@@ -185,7 +187,12 @@ class ResNeXtRealVsAITrainer:
                 patience_cnt = 0
                 if save_name:
                     os.makedirs("runs", exist_ok=True)
-                    torch.save(self.model.state_dict(), os.path.join("runs", f"model_resnext_real_vs_ai_{save_name}.pt"))
+                    new_path = os.path.join("runs", f"model_resnext_real_vs_ai_{save_name}_{val_acc:.4f}.pt")
+                    # Delete previous best model if it exists
+                    if prev_best_path and os.path.exists(prev_best_path):
+                        os.remove(prev_best_path)
+                    torch.save(self.model.state_dict(), new_path)
+                    prev_best_path = new_path
             else:
                 patience_cnt += 1
                 if self.patience and patience_cnt >= self.patience:
@@ -248,3 +255,65 @@ class ResNeXtRealVsAITrainer:
         ds = ImageCSVDataset(classes, csv_path, img_dir, transform)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
         return loader
+
+    def load_weights(self, ckpt_path: str, strict: bool = True):
+        """
+        Load parameters from a .pt file (state-dict only).
+
+        Args
+        ----
+        ckpt_path : str
+            Path to the *.pt* file you wrote with ``torch.save(model.state_dict())``.
+        strict : bool, default=True
+            Pass False if your key-names have a ``'module.'`` prefix from
+            DataParallel/DistributedDataParallel and you strip it manually.
+
+        Notes
+        -----
+        • The network architecture must already be built exactly as during training  
+        (same `backbone_var`, `num_classes`, etc.).  
+        • Leaves the network on the correct device and in ``eval`` mode.
+        """
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(state, strict=strict)
+        self.model.to(self.device)
+        self.model.eval()
+
+    def evaluate(self, loader, save_prefix="eval_results"):
+        """
+        Evaluate the model, save predictions and a classification report in the results folder.
+        Args:
+            loader: DataLoader for evaluation.
+            save_prefix: Prefix for the output files (default: 'eval_results').
+        """
+        os.makedirs("results", exist_ok=True)
+
+        self.model.eval()
+        all_preds = []
+        all_labels = []
+        with torch.no_grad(), autocast():
+            for imgs, lbls in loader:
+                imgs = imgs.to(self.device)
+                out = self.model(imgs)
+                preds = out.argmax(1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(lbls.cpu().numpy())
+
+        # Save predictions to CSV
+        df = pd.DataFrame({
+            "index": list(range(len(all_labels))),
+            "true_label": all_labels,
+            "pred_label": all_preds
+        })
+        
+        csv_path = os.path.join("results", f"{save_prefix}_predictions.csv")
+        df.to_csv(csv_path, index=False)
+
+        # Save classification report
+        report = classification_report(all_labels, all_preds, digits=4)
+        report_path = os.path.join("results", f"{save_prefix}_classification_report.txt")
+        with open(report_path, "w") as f:
+            f.write(report)
+
+        # Optionally, return the report string and DataFrame
+        return report, df
