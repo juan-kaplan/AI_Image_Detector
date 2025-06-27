@@ -89,8 +89,9 @@ def run_model(model_params, data_params):
 
 
 
-def test_model(model_params, model_path, test_dataset_path, seasons_only=False, topk=None):
+def test_model(model_params, data_params, model_path, test_dataset_path, seasons_only=False, topk=None):
     model, names = load_model(model_params)
+    save_path = create_result_folder(model_params, data_params)
     if isinstance(model, resnext_real_vs_ai.ResNeXtRealVsAITrainer):
         # Prepare dataloader using the new method
         test_loader = model.create_dataloader(
@@ -102,7 +103,7 @@ def test_model(model_params, model_path, test_dataset_path, seasons_only=False, 
             shuffle=False
         )
         model.load_weights(model_path)
-        model.evaluate(test_loader)
+        model.evaluate(test_loader, save_path=save_path)
         pass
     else:
         model.load_params_model(model_path, names)

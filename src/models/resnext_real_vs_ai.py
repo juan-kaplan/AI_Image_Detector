@@ -8,7 +8,9 @@ from torchvision import transforms
 import os
 import pandas as pd
 from PIL import Image
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 class ImageCSVDataset(Dataset):
@@ -16,24 +18,27 @@ class ImageCSVDataset(Dataset):
         self.df = pd.read_csv(csv_path)
         if "filepath" not in self.df.columns or "label" not in self.df.columns:
             raise ValueError("El CSV debe tener columnas 'filepath' y 'label'.")
-        self.img_dir = img_dir or ""
-        self.transform = transform
-        self.label_map = {cls: idx for idx, cls in enumerate(classes)}
+        self.img_dir    = img_dir or ""
+        self.transform  = transform
+        self.label_map  = {cls: idx for idx, cls in enumerate(classes)}
+        # keep the original class names for confusion matrix plotting
+        self.classes    = list(classes)
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        path = (
-            os.path.join(self.img_dir, row["filepath"])
-            if self.img_dir and not os.path.isabs(row["filepath"])
-            else row["filepath"]
-        )
+        row   = self.df.iloc[idx]
+
+        path  = row["filepath"]
+
         image = Image.open(path).convert("RGB")
         label = self.label_map[row["label"]]
-        image = self.transform(image)
-        return image, label
+        generator = row['generator']
+
+        if self.transform:
+                image = self.transform(image)
+        return image, label, path, generator
 
 
 class ResNeXtRealVsAITrainer:
@@ -238,82 +243,157 @@ class ResNeXtRealVsAITrainer:
     def create_dataloader(self, classes, csv_path, img_dir=None, batch_size=32, num_workers=4, test=False, shuffle=True):
         mean = [0.485, 0.456, 0.406]
         std  = [0.229, 0.224, 0.225]
-        if test:
-            transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            transform = transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ])
+        crop_size = 224
+        # if test:
+        #     transform = transforms.Compose([
+        #         transforms.Resize((224, 224)),
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(mean, std),
+        #     ])
+        # else:
+        #     transform = transforms.Compose([
+        #         transforms.Resize((256, 256)),
+        #         transforms.RandomResizedCrop(224),
+        #         transforms.RandomHorizontalFlip(),
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(mean, std),
+        #     ])
+
+        base_transforms = [
+            transforms.Resize((256, 256)),
+            transforms.RandomResizedCrop(crop_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ]
+
+        # if you truly want randomness at test time, reuse the same:
+        transform = transforms.Compose(base_transforms)
         ds = ImageCSVDataset(classes, csv_path, img_dir, transform)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
         return loader
 
     def load_weights(self, ckpt_path: str, strict: bool = True):
-        """
-        Load parameters from a .pt file (state-dict only).
-
-        Args
-        ----
-        ckpt_path : str
-            Path to the *.pt* file you wrote with ``torch.save(model.state_dict())``.
-        strict : bool, default=True
-            Pass False if your key-names have a ``'module.'`` prefix from
-            DataParallel/DistributedDataParallel and you strip it manually.
-
-        Notes
-        -----
-        • The network architecture must already be built exactly as during training  
-        (same `backbone_var`, `num_classes`, etc.).  
-        • Leaves the network on the correct device and in ``eval`` mode.
-        """
         state = torch.load(ckpt_path, map_location=self.device)
         self.model.load_state_dict(state, strict=strict)
         self.model.to(self.device)
         self.model.eval()
 
-    def evaluate(self, loader, save_prefix="eval_results"):
+    def evaluate(self, loader, save_path=None):
         """
-        Evaluate the model, save predictions and a classification report in the results folder.
+        Evaluate the model, save predictions, a classification report, a confusion matrix,
+        and a generator×prediction matrix (both CSV and heatmap).
+
         Args:
-            loader: DataLoader for evaluation.
-            save_prefix: Prefix for the output files (default: 'eval_results').
+            loader (DataLoader): yields (imgs, labels, filepaths, generator)
+            save_path (str, optional): directory to write outputs. Defaults to "results".
+
+        Returns:
+            report_str (str): the classification report
+            df_preds (pd.DataFrame): dataframe of all predictions
+            df_gen_matrix (pd.DataFrame): generator × pred_label matrix
         """
-        os.makedirs("results", exist_ok=True)
+        # 1) Prepare output directory
+        if save_path is None:
+            save_path = "results"
+        os.makedirs(save_path, exist_ok=True)
 
+        # 2) Run inference
         self.model.eval()
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels, all_paths, all_gens = [], [], [], []
         with torch.no_grad(), autocast():
-            for imgs, lbls in loader:
+            for imgs, labels, paths, gens in loader:
                 imgs = imgs.to(self.device)
-                out = self.model(imgs)
-                preds = out.argmax(1).cpu().numpy()
+                logits = self.model(imgs)
+                preds = logits.argmax(dim=1).cpu().numpy()
+
                 all_preds.extend(preds)
-                all_labels.extend(lbls.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                all_paths.extend(paths)
+                all_gens.extend(gens)
 
-        # Save predictions to CSV
-        df = pd.DataFrame({
-            "index": list(range(len(all_labels))),
+        # 3) Save predictions CSV
+        df_preds = pd.DataFrame({
+            "filepath":   all_paths,
             "true_label": all_labels,
-            "pred_label": all_preds
+            "pred_label": all_preds,
+            "generator":  all_gens
         })
-        
-        csv_path = os.path.join("results", f"{save_prefix}_predictions.csv")
-        df.to_csv(csv_path, index=False)
+        df_preds.to_csv(os.path.join(save_path, "predictions.csv"), index=False)
 
-        # Save classification report
-        report = classification_report(all_labels, all_preds, digits=4)
-        report_path = os.path.join("results", f"{save_prefix}_classification_report.txt")
-        with open(report_path, "w") as f:
-            f.write(report)
+        # 4) Classification report
+        report_str = classification_report(all_labels, all_preds, digits=4)
+        with open(os.path.join(save_path, "classification_report.txt"), "w") as f:
+            f.write(report_str)
 
-        # Optionally, return the report string and DataFrame
-        return report, df
+        # 5) Overall confusion matrix (true vs. pred)
+        cm = confusion_matrix(all_labels, all_preds)
+        dataset    = getattr(loader, "dataset", None)
+        class_names = getattr(dataset, "classes", None)
+
+        fig, ax = plt.subplots()
+        im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+        plt.colorbar(im, ax=ax)
+        if class_names is not None:
+            ax.set(
+                xticks=np.arange(len(class_names)),
+                yticks=np.arange(len(class_names)),
+                xticklabels=class_names,
+                yticklabels=class_names,
+                xlabel="Predicted label",
+                ylabel="True label",
+                title="Confusion Matrix"
+            )
+            plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        else:
+            ax.set(xlabel="Predicted label", ylabel="True label", title="Confusion Matrix")
+
+        thresh = cm.max() / 2.0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, cm[i, j], ha="center", va="center",
+                        color="white" if cm[i, j] > thresh else "black")
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_path, "confusion_matrix.png"))
+        plt.close(fig)
+
+        # 6) Generator × Predicted-label matrix
+        #    Build a crosstab: rows = generators, columns = predicted labels
+        mapped_preds = ["real" if p == 0 else "fake" for p in all_preds]
+        df_gen = pd.DataFrame({
+            "generator":  all_gens,
+            "pred_label": mapped_preds
+        })
+
+        df_gen_matrix = pd.crosstab(df_gen["generator"], df_gen["pred_label"])
+
+        # Save CSV
+        df_gen_matrix.to_csv(os.path.join(save_path, "generator_prediction_matrix.csv"))
+
+        # Plot heatmap
+        fig, ax = plt.subplots()
+        im = ax.imshow(df_gen_matrix.values, interpolation="nearest", cmap=plt.cm.Oranges)
+        plt.colorbar(im, ax=ax)
+        ax.set(
+            xticks=np.arange(df_gen_matrix.shape[1]),
+            yticks=np.arange(df_gen_matrix.shape[0]),
+            xticklabels=df_gen_matrix.columns,
+            yticklabels=df_gen_matrix.index,
+            xlabel="Predicted label",
+            ylabel="Generator",
+            title="Generator vs. Predicted-Label"
+        )
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+        # Annotate counts
+        thresh2 = df_gen_matrix.values.max() / 2.0
+        for i in range(df_gen_matrix.shape[0]):
+            for j in range(df_gen_matrix.shape[1]):
+                count = df_gen_matrix.iat[i, j]
+                ax.text(j, i, count, ha="center", va="center",
+                        color="white" if count > thresh2 else "black")
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_path, "generator_prediction_matrix.png"))
+        plt.close(fig)
+
+        # 7) Return everything
+        return report_str, df_preds, df_gen_matrix

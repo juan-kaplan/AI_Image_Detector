@@ -13,6 +13,7 @@ from src.pipeline import run_model, test_model
 # python main.py --configs .\configs\mod_resNeXt_ft.py
 # python main.py --configs .\configs\mod_resNeXt_ft.py --path_test .\data\splits\test.csv --path_model .\runs\model_mod_resNeXt_ft.pt
 # python main.py --configs .\configs\mod_resNeXt_ft.py --path_test .\data\splits\test.csv --path_model .\runs\model_resnext_real_vs_ai_mod_resNeXt_ft_0.9582.pt
+# python main.py --configs .\configs\mod_resNeXt_ft.py --path_test .\data\test_data\csvs\test_data.csv --path_model .\runs\model_resnext_real_vs_ai_mod_resNeXt_ft_0.9582.pt
 
 def main(args):
     check_args = read_configs(args)
@@ -29,7 +30,7 @@ def main(args):
         _, model, data, model_path, test_dataset_path = check_args
         seasons_only = getattr(args, "seasons_only", False)
         topk = getattr(args, "topk", None)
-        test_model(model, model_path, test_dataset_path, seasons_only=seasons_only, topk=topk)
+        test_model(model, data, model_path, test_dataset_path, seasons_only=seasons_only, topk=topk)
         
         
 
