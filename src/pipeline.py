@@ -1,7 +1,9 @@
 from src.utils.files import create_result_folder
 from src.models import resnext_real_vs_ai
+from src.models import resnext_real_vs_ai_transformer
 # from src.models import mcf_features_nn
 import pandas as pd
+from src.utils.build_real_vs_ai import build
 
 # from src.train_test.train import train
 # from src.train_test.test import test
@@ -43,50 +45,68 @@ def load_model(model_params):
     model = None
     
     if model_name == 'resnext_real_vs_ai':
-        model = resnext_real_vs_ai.ResNeXtRealVsAITrainer(model_params)
+        model = resnext_real_vs_ai.ResNeXtRealVsAI(model_params)
+        
+    elif model_name == 'resnext_real_vs_ai_transformer':
+        model = resnext_real_vs_ai_transformer.ResNeXtRealVsAITransformer(model_params)
     return model, ['real', 'fake']
 
 
-def run_model(model_params, data_params):
-    """
-    Run the machine learning model training and evaluation pipeline.
+# def run_model(model_params, data_params):
+#     """
+#     Run the machine learning model training and evaluation pipeline.
 
-    Args:
-    model_params (dict): Parameters related to the machine learning model configuration.
-    data_params (dict): Parameters related to the dataset configuration.
+#     Args:
+#     model_params (dict): Parameters related to the machine learning model configuration.
+#     data_params (dict): Parameters related to the dataset configuration.
 
-    Returns:
-    dict: A dictionary containing paths to saved results ('save_path' and 'save_cv_path').
-    """
-    save_path = create_result_folder(model_params, data_params)
+#     Returns:
+#     dict: A dictionary containing paths to saved results ('save_path' and 'save_cv_path').
+#     """
+#     save_path = create_result_folder(model_params, data_params)
     
-    model, names = load_model(model_params)
-    if isinstance(model, resnext_real_vs_ai.ResNeXtRealVsAITrainer):
-        # Prepare dataloaders using the new method
-        train_loader = model.create_dataloader(
-            names,
-            data_params['data_train_path'],
-            batch_size=model.batch_size_tr,
-            num_workers=model.num_workers,
-            test=False,
-            shuffle=True
-        )
-        val_loader = model.create_dataloader(
-            names,
-            data_params['data_val_path'],
-            batch_size=model.batch_size_va,
-            num_workers=model.num_workers,
-            test=True,
-            shuffle=False
-        )
-        save_name = model_params.get('configs_file_name', None)
-        model.fit(train_loader, val_loader, save_name=save_name)
-        # Optionally, you can add evaluation logic here
-    else:
-        model.train_model(data_params['data_train_path'], data_params['data_val_path'], names, model_params=model_params, save_name=model_params['configs_file_name'])
-        model.eval_model(data_params['data_val_path'], save_path)
-    return save_path
+#     model, names = load_model(model_params)
+    
+#     # Prepare dataloaders using the new method
+#     train_loader = model.create_dataloader(
+#         names,
+#         data_params['data_train_path'],
+#         batch_size=model.batch_size_tr,
+#         num_workers=model.num_workers,
+#         test=False,
+#         shuffle=True
+#     )
+#     val_loader = model.create_dataloader(
+#         names,
+#         data_params['data_val_path'],
+#         batch_size=model.batch_size_va,
+#         num_workers=model.num_workers,
+#         test=True,
+#         shuffle=False
+#     )
+#     save_name = model_params.get('configs_file_name', None)
+#     model.fit(train_loader, val_loader, save_name=save_name)
+#     # Optionally, you can add evaluation logic here
+#     return save_path
 
+def run_model(model_params, data_params):
+    save_path = create_result_folder(model_params, data_params)
+    model, _  = load_model(model_params)
+
+    mixed = build()      # <- returns DatasetDict with train/val/test
+    train_loader = model.create_dataloader(None, mixed["train"],
+                                           batch_size=model.batch_size_tr,
+                                           num_workers=model.num_workers,
+                                           shuffle=True)
+    val_loader   = model.create_dataloader(None, mixed["validation"],
+                                           batch_size=model.batch_size_va,
+                                           num_workers=model.num_workers,
+                                           shuffle=False)
+
+    model.fit(train_loader, val_loader,
+              save_name=model_params.get("configs_file_name"))
+
+    return save_path
 
 
 def test_model(model_params, data_params, model_path, test_dataset_path, seasons_only=False, topk=None):

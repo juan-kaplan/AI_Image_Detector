@@ -40,6 +40,25 @@ class ImageCSVDataset(Dataset):
                 image = self.transform(image)
         return image, label, path, generator
 
+class HFDatasetWrapper(torch.utils.data.Dataset):
+    """
+    Thin wrapper that:
+      • accepts a Hugging Face split (`datasets.Dataset`)
+      • applies torchvision transforms on the fly
+      • returns exactly (image_tensor, label_int)
+    """
+    def __init__(self, hf_split, transform):
+        self.ds = hf_split
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        sample = self.ds[idx]                     # {'image': PIL, 'label': int, ...}
+        img = self.transform(sample["image"])
+        return img, sample["label"]
+
 class TransformerHead(nn.Module):
     """
     Converts the 7×7 feature map (B, C, H, W) to a sequence of tokens,
@@ -285,23 +304,34 @@ class ResNeXtRealVsAITransformer:
         val_acc = correct / len(loader.dataset)
         return val_loss, val_acc
 
-    def create_dataloader(self, classes, csv_path, img_dir=None, batch_size=32, num_workers=4, test=False, shuffle=True):
-        mean = [0.485, 0.456, 0.406]
-        std  = [0.229, 0.224, 0.225]
-        crop_size = 224
-
-        base_transforms = [
-            transforms.Resize((256, 256)),
-            transforms.RandomResizedCrop(crop_size),
+    def create_dataloader(
+            self,
+            dataset_or_classes,
+            split_or_path,        # accepts HF split or CSV path
+            *,
+            batch_size=32,
+            num_workers=4,
+            shuffle=True
+    ):
+        mean, std = [0.485,0.456,0.406], [0.229,0.224,0.225]
+        transform = transforms.Compose([
+            transforms.Resize((256,256)),
+            transforms.RandomResizedCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
-        ]
+        ])
 
-        # if you truly want randomness at test time, reuse the same:
-        transform = transforms.Compose(base_transforms)
-        ds = ImageCSVDataset(classes, csv_path, img_dir, transform)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
-        return loader
+        if isinstance(split_or_path, str):           # OLD behaviour — CSV
+            ds_obj = ImageCSVDataset(dataset_or_classes, split_or_path,
+                                    transform=transform)
+        else:                                        # NEW behaviour — HF dataset
+            ds_obj = HFDatasetWrapper(split_or_path, transform)
+
+        return DataLoader(ds_obj,
+                        batch_size=batch_size,
+                        shuffle=shuffle,
+                        num_workers=num_workers,
+                        pin_memory=True)
 
     def load_weights(self, ckpt_path: str, strict: bool = True):
         state = torch.load(ckpt_path, map_location=self.device)
