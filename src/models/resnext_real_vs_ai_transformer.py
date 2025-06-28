@@ -40,8 +40,40 @@ class ImageCSVDataset(Dataset):
                 image = self.transform(image)
         return image, label, path, generator
 
+class TransformerHead(nn.Module):
+    """
+    Converts the 7×7 feature map (B, C, H, W) to a sequence of tokens,
+    runs a few self-attn layers, then classifies with a linear layer.
+    """
+    def __init__(self, d_model, n_cls, n_layers=2, n_heads=8,
+                mlp_mult=4, dropout=0.1, pool='cls'):
+        super().__init__()
+        self.pool = pool
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * mlp_mult,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc, n_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.fc = nn.Linear(d_model, n_cls)
 
-class ResNeXtRealVsAI:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):          
+        B, C, H, W = x.shape
+        x = x.flatten(2).permute(0, 2, 1)
+        cls = self.cls_token.expand(B, -1, -1)  
+        x = torch.cat((cls, x), dim=1)    
+        x = self.transformer(x)
+        x = x[:, 0] if self.pool == 'cls' else x[:, 1:].mean(1)
+        x = self.norm(x)
+        return self.fc(x)
+
+class ResNeXtRealVsAITransformer:
     """
     Fine-tunes ResNeXt-50 32×4d for 2-class 'real vs AI' detection,
     letting the caller select which backbone layers stay frozen.
@@ -88,9 +120,14 @@ class ResNeXtRealVsAI:
             self.batch_size_va    = model_params.get("batch_size_va",    self.batch_size_va)
             self.num_workers      = model_params.get("num_workers",      self.num_workers)
 
-            # NEW: layer control
             self.unfreeze_layers  = model_params.get("unfreeze_layers",  self.unfreeze_layers)
             self.freeze_layers    = model_params.get("freeze_layers",    self.freeze_layers)
+
+            # Transformer params
+            self.encoder_blocks    = model_params.get("encoder_blocks",    self.encoder_blocks)
+            self.attention_heads      = model_params.get("attention_heads",      self.attention_heads)
+            self.mlp_expansion_factor        = model_params.get("mlp_expansion_factor",        self.mlp_expansion_factor) 
+            self.ckpt_path    = model_params.get("ckpt_path", self.ckpt_path)
 
         self.device = torch.device(self.device)
         self._build_model()
@@ -104,6 +141,9 @@ class ResNeXtRealVsAI:
         self.model = getattr(models, self.backbone_var)(
             weights="IMAGENET1K_V1" if self.pretrained else None
         )
+        state = torch.load(self.ckpt_path, map_location=self.device)
+        self.model.load_state_dict(state, strict=True)
+        self.model.to(self.device)
 
         # --- 1. freeze everything ---------------------------------------
         for p in self.model.parameters():
@@ -126,15 +166,20 @@ class ResNeXtRealVsAI:
                 p.requires_grad_(False)
 
         # --- 4. replace fc ----------------------------------------------
-        in_feats = self.model.fc.in_features  # 2048 for ResNeXt-50
-        self.model.fc = nn.Sequential(
-            nn.Linear(in_feats, in_feats // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.dropout),
-            nn.Linear(in_feats // 2, self.num_classes),
-        )
+        in_feats = self.model.fc.in_features        # 2048 for ResNeXt-50
+        self.model.avgpool = nn.Identity()          # keep spatial grid
         
-        # ensure head is trainable
+        # replaced fully connected layer with a transformer encoder layer, a normalization layer and a linear layer.
+        self.model.fc = TransformerHead(
+            d_model=in_feats,
+            n_cls=self.num_classes,
+            dropout=self.dropout,
+            n_layers=self.encoder_blocks,  
+            n_heads=self.attention_heads,   
+            mlp_mult=self.mlp_expansion_factor,  
+        )
+
+        # make sure the head is trainable
         for p in self.model.fc.parameters():
             p.requires_grad_(True)
 
@@ -244,20 +289,6 @@ class ResNeXtRealVsAI:
         mean = [0.485, 0.456, 0.406]
         std  = [0.229, 0.224, 0.225]
         crop_size = 224
-        # if test:
-        #     transform = transforms.Compose([
-        #         transforms.Resize((224, 224)),
-        #         transforms.ToTensor(),
-        #         transforms.Normalize(mean, std),
-        #     ])
-        # else:
-        #     transform = transforms.Compose([
-        #         transforms.Resize((256, 256)),
-        #         transforms.RandomResizedCrop(224),
-        #         transforms.RandomHorizontalFlip(),
-        #         transforms.ToTensor(),
-        #         transforms.Normalize(mean, std),
-        #     ])
 
         base_transforms = [
             transforms.Resize((256, 256)),
@@ -395,5 +426,4 @@ class ResNeXtRealVsAI:
         fig.savefig(os.path.join(save_path, "generator_prediction_matrix.png"))
         plt.close(fig)
 
-        # 7) Return everything
         return report_str, df_preds, df_gen_matrix
