@@ -21,7 +21,7 @@ def transform_real_ds(ds):
     ds = ds.add_column("label", [0] * len(ds))
     return ds
 
-def build_dataset():
+def build_datasets():
     fake_ds = load_dataset(
         "lesc-unifi/dragon",
         "Large",

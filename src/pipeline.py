@@ -4,6 +4,7 @@ from src.models import resnext_real_vs_ai_transformer
 # from src.models import mcf_features_nn
 import pandas as pd
 from src.utils.build_real_vs_ai import build
+from src.utils.retrieve_datasets import build_datasets
 
 # from src.train_test.train import train
 # from src.train_test.test import test
@@ -93,12 +94,12 @@ def run_model(model_params, data_params):
     save_path = create_result_folder(model_params, data_params)
     model, _  = load_model(model_params)
 
-    mixed = build()      # <- returns DatasetDict with train/val/test
-    train_loader = model.create_dataloader(None, mixed["train"],
+    datasets = build_datasets()      # <- returns DatasetDict with train/val/test
+    train_loader = model.create_dataloader(None, datasets["train"],
                                            batch_size=model.batch_size_tr,
                                            num_workers=model.num_workers,
                                            shuffle=True)
-    val_loader   = model.create_dataloader(None, mixed["validation"],
+    val_loader   = model.create_dataloader(None, datasets["validation"],
                                            batch_size=model.batch_size_va,
                                            num_workers=model.num_workers,
                                            shuffle=False)
