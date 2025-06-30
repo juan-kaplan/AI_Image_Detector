@@ -272,9 +272,32 @@ class ResNeXtRealVsAI:
         loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
         return loader
 
-    def load_weights(self, ckpt_path: str, strict: bool = True):
+    def load_checkpoint(self, ckpt_path: str, strict: bool = True):
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+
+        # 2. optimiser / scheduler / scaler – only if they exist
+        if "optimizer" in ckpt:
+            self.model.load_state_dict(ckpt["model"], strict=strict)
+            self._build_optim()                     # create them first
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+            self.scaler.load_state_dict(ckpt["scaler"])
+            for st in self.optimizer.state.values():
+                for k, v in st.items():
+                    if torch.is_tensor(v):
+                        st[k] = v.to(self.device)
+                    
+        else:
+            self.model.load_state_dict(ckpt, strict=strict)
+        self.model.to(self.device) 
+        
+    def load_model_for_inference(self, ckpt_path, strict=True):
         state = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(state, strict=strict)
+        
+        if 'model' in state:
+            self.model.load_state_dict(state["model"], strict=strict)
+        else:
+            self.model.load_state_dict(state, strict=strict)
         self.model.to(self.device)
         self.model.eval()
 

@@ -11,6 +11,10 @@ from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import trange
+from tqdm import tqdm
+import torch.nn.functional as F
+
 
 
 class ImageCSVDataset(Dataset):
@@ -40,7 +44,7 @@ class ImageCSVDataset(Dataset):
                 image = self.transform(image)
         return image, label, path, generator
 
-class HFDatasetWrapper(torch.utils.data.Dataset):
+class HFDatasetWrapper(Dataset):
     """
     Thin wrapper that:
       • accepts a Hugging Face split (`datasets.Dataset`)
@@ -55,8 +59,11 @@ class HFDatasetWrapper(torch.utils.data.Dataset):
         return len(self.ds)
 
     def __getitem__(self, idx):
-        sample = self.ds[idx]                     # {'image': PIL, 'label': int, ...}
-        img = self.transform(sample["image"])
+        sample = self.ds[idx]                 # {'image': PIL, 'label': int, ...}
+        img = sample["image"]
+        # force 3-channel RGB (in-place no-op if already RGB)
+        img = img.convert("RGB")
+        img = self.transform(img)
         return img, sample["label"]
 
 class TransformerHead(nn.Module):
@@ -79,10 +86,15 @@ class TransformerHead(nn.Module):
         self.transformer = nn.TransformerEncoder(enc, n_layers)
         self.norm = nn.LayerNorm(d_model)
         self.fc = nn.Linear(d_model, n_cls)
-
+        
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-    def forward(self, x):          
+    def forward(self, x): 
+        if x.dim() == 2:
+            B, N = x.shape
+            d_model = self.cls_token.shape[-1]      # 2048 en su caso
+            side = int((N // d_model) ** 0.5)       # H = W = 7
+            x = x.view(B, d_model, side, side)         
         B, C, H, W = x.shape
         x = x.flatten(2).permute(0, 2, 1)
         cls = self.cls_token.expand(B, -1, -1)  
@@ -112,7 +124,8 @@ class ResNeXtRealVsAITransformer:
         self.weight_decay   = 1e-4
         self.num_epochs     = 10
         self.patience       = 2
-
+        self.lr_on_plateau_patience = 5  # epochs with no improvement before reducing LR
+        self.loss_weight    = 1.0          # weight for the positive class (AI images)
         self.batch_size_tr  = 32
         self.batch_size_va  = 64
         self.num_workers    = 4
@@ -121,6 +134,11 @@ class ResNeXtRealVsAITransformer:
         self.unfreeze_layers = ["layer4"]                 # default behaviour
         self.freeze_layers   = []                         # none explicitly
 
+        self.encoder_blocks    = 6
+        self.attention_heads   = 8
+        self.mlp_expansion_factor = 4
+        self.ckpt_path = "runs/model_resnext_real_vs_ai_transformer.pt"
+        
         # ------------------ overrides from dict -------------------------
         if model_params:
             self.num_classes      = model_params.get("num_classes",      self.num_classes)
@@ -134,6 +152,9 @@ class ResNeXtRealVsAITransformer:
             self.weight_decay     = model_params.get("weight_decay",     self.weight_decay)
             self.num_epochs       = model_params.get("num_epochs",       self.num_epochs)
             self.patience         = model_params.get("early_stopping_patience",         self.patience)
+            self.lr_on_plateau_patience = model_params.get("lr_on_plateau_patience", self.lr_on_plateau_patience)
+            self.loss_weight      = model_params.get("loss_weight",      self.loss_weight)
+
 
             self.batch_size_tr    = model_params.get("batch_size_tr",    self.batch_size_tr)
             self.batch_size_va    = model_params.get("batch_size_va",    self.batch_size_va)
@@ -146,7 +167,8 @@ class ResNeXtRealVsAITransformer:
             self.encoder_blocks    = model_params.get("encoder_blocks",    self.encoder_blocks)
             self.attention_heads      = model_params.get("attention_heads",      self.attention_heads)
             self.mlp_expansion_factor        = model_params.get("mlp_expansion_factor",        self.mlp_expansion_factor) 
-            self.ckpt_path    = model_params.get("ckpt_path", self.ckpt_path)
+            self.ckpt_path    = model_params.get("ckpt_path", self.ckpt_path) #path del modelo resnext finetuneado
+            self.load_ckpt_seed = model_params.get('load_ckpt_seed', None) #path de instancia de este objeto ya entrenado
 
         self.device = torch.device(self.device)
         self._build_model()
@@ -157,12 +179,20 @@ class ResNeXtRealVsAITransformer:
     # ------------------------------------------------------------------ #
     def _build_model(self):
         """Create backbone, freeze / unfreeze as requested, replace head."""
+            
         self.model = getattr(models, self.backbone_var)(
             weights="IMAGENET1K_V1" if self.pretrained else None
         )
         state = torch.load(self.ckpt_path, map_location=self.device)
-        self.model.load_state_dict(state, strict=True)
+
+        # filter out any head weights:
+        backbone_state = {k: v for k, v in state.items() if not k.startswith("fc.")}
+
+        # load only those, ignore missing/unexpected:
+        missing, unexpected = self.model.load_state_dict(backbone_state, strict=False)
+        print(f"[INFO] Backbone loaded; missing keys: {missing}\nunexpected keys: {unexpected}")
         self.model.to(self.device)
+
 
         # --- 1. freeze everything ---------------------------------------
         for p in self.model.parameters():
@@ -198,6 +228,9 @@ class ResNeXtRealVsAITransformer:
             mlp_mult=self.mlp_expansion_factor,  
         )
 
+        if self.load_ckpt_seed:
+            self.load_checkpoint(self.load_ckpt_seed, strict=True)
+
         # make sure the head is trainable
         for p in self.model.fc.parameters():
             p.requires_grad_(True)
@@ -224,13 +257,13 @@ class ResNeXtRealVsAITransformer:
         )
 
         self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.3, patience=self.patience
+            self.optimizer, mode="min", factor=0.3, patience=self.lr_on_plateau_patience,
         )
         
         self.scaler = GradScaler()
         
         self.criterion = (
-            nn.BCEWithLogitsLoss() if self.num_classes == 1 else nn.CrossEntropyLoss()
+            self.loss_function
         )
 
     # ------------------------------------------------------------------ #
@@ -240,7 +273,7 @@ class ResNeXtRealVsAITransformer:
         best_val_acc = -float("inf")
         patience_cnt = 0
         prev_best_path = None
-        for epoch in range(self.num_epochs):
+        for epoch in trange(self.num_epochs, desc="Epochs"):
             train_loss = self._train_one_epoch(train_loader)
             val_loss, val_acc = 0.0, 0.0
             if val_loader is not None:
@@ -260,7 +293,12 @@ class ResNeXtRealVsAITransformer:
                     # Delete previous best model if it exists
                     if prev_best_path and os.path.exists(prev_best_path):
                         os.remove(prev_best_path)
-                    torch.save(self.model.state_dict(), new_path)
+                    torch.save({
+                        "model":      self.model.state_dict(),
+                        "optimizer":  self.optimizer.state_dict(),
+                        "scheduler":  self.scheduler.state_dict(),
+                        "scaler":     self.scaler.state_dict(),
+                    }, new_path)
                     prev_best_path = new_path
             else:
                 patience_cnt += 1
@@ -273,13 +311,13 @@ class ResNeXtRealVsAITransformer:
     def _train_one_epoch(self, loader):
         self.model.train()
         running = 0.0
-        for imgs, lbls in loader:
+        for imgs, lbls in tqdm(loader, desc="Training", leave=False):
             imgs, lbls = imgs.to(self.device), lbls.to(self.device)
 
             self.optimizer.zero_grad(set_to_none=True)
             with autocast():
                 out = self.model(imgs)
-                loss = self.criterion(out, lbls)
+                loss = self.criterion(out, lbls, pos_weight=self.loss_weight)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -293,11 +331,11 @@ class ResNeXtRealVsAITransformer:
         self.model.eval()
         loss_sum, correct = 0.0, 0
         with torch.no_grad(), autocast():
-            for imgs, lbls in loader:
+            for imgs, lbls in tqdm(loader, desc="Validating", leave=False):
                 imgs, lbls = imgs.to(self.device), lbls.to(self.device)
                 out = self.model(imgs)
-                loss_sum += self.criterion(out, lbls).item() * imgs.size(0)
-                preds = out.argmax(1)
+                loss_sum += self.criterion(out, lbls, pos_weight=self.loss_weight ).item() * imgs.size(0)
+                preds = out.argmax(dim=1)
                 correct += (preds == lbls).sum().item()
 
         val_loss = loss_sum / len(loader.dataset)
@@ -320,11 +358,7 @@ class ResNeXtRealVsAITransformer:
             transforms.Normalize(mean, std),
         ])
 
-        if isinstance(split_or_path, str):           # OLD behaviour — CSV
-            ds_obj = ImageCSVDataset(dataset_or_classes, split_or_path,
-                                    transform=transform)
-        else:                                        # NEW behaviour — HF dataset
-            ds_obj = HFDatasetWrapper(split_or_path, transform)
+        ds_obj = HFDatasetWrapper(split_or_path, transform)
 
         return DataLoader(ds_obj,
                         batch_size=batch_size,
@@ -332,127 +366,85 @@ class ResNeXtRealVsAITransformer:
                         num_workers=num_workers,
                         pin_memory=True)
 
-    def load_weights(self, ckpt_path: str, strict: bool = True):
+    def load_model_weights(self, ckpt_path: str, strict: bool = True):
         state = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(state, strict=strict)
+        if 'model' in state:
+            self.model.load_state_dict(state['model'], strict=strict)
+        else:
+            self.model.load_state_dict(state, strict=strict)
+        self.model.to(self.device)
+        
+    def load_checkpoint(self, ckpt_path: str, strict: bool = True):
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+
+        # 2. optimiser / scheduler / scaler – only if they exist
+        if "optimizer" in ckpt:
+            self.model.load_state_dict(ckpt["model"], strict=strict)
+            self._build_optim()                     # create them first
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+            self.scaler.load_state_dict(ckpt["scaler"])
+            for st in self.optimizer.state.values():
+                for k, v in st.items():
+                    if torch.is_tensor(v):
+                        st[k] = v.to(self.device)
+                    
+        else:
+            self.model.load_state_dict(ckpt, strict=strict)
+        self.model.to(self.device)  
+        
+    def loss_function(
+            self,
+            logits: torch.Tensor,
+            targets: torch.Tensor,
+            pos_weight: float = 1.0,           # >1 ⇒ penalise fake-as-real more
+            reduction: str = "mean"
+    ) -> torch.Tensor:
+        """
+        Weighted cross-entropy for 2-class (real=0, fake=1).
+
+        `pos_weight` multiplies the contribution of the *fake* class (index 1).
+        """
+        # class-wise weights:   [real_weight, fake_weight]
+        weight = torch.tensor([1.0, pos_weight],
+                            device=logits.device,
+                            dtype=logits.dtype)
+
+        # make sure labels are long ints and 1-D
+        targets = targets.long().view(-1)
+
+        return F.cross_entropy(logits, targets,
+                            weight=weight,
+                            reduction=reduction) 
+        
+    def load_model_for_inference(self, ckpt_path, strict=True):
+        state = torch.load(ckpt_path, map_location=self.device)
+        
+        if 'model' in state:
+            self.model.load_state_dict(state["model"], strict=strict)
+        else:
+            self.model.load_state_dict(state, strict=strict)
         self.model.to(self.device)
         self.model.eval()
-
-    def evaluate(self, loader, save_path=None):
+    
+    def predict_image(self, image):
         """
-        Evaluate the model, save predictions, a classification report, a confusion matrix,
-        and a generator×prediction matrix (both CSV and heatmap).
-
-        Args:
-            loader (DataLoader): yields (imgs, labels, filepaths, generator)
-            save_path (str, optional): directory to write outputs. Defaults to "results".
-
-        Returns:
-            report_str (str): the classification report
-            df_preds (pd.DataFrame): dataframe of all predictions
-            df_gen_matrix (pd.DataFrame): generator × pred_label matrix
+        Predict the class of a single image (PIL.Image or file path).
+        Returns the predicted class index (int).
         """
-        # 1) Prepare output directory
-        if save_path is None:
-            save_path = "results"
-        os.makedirs(save_path, exist_ok=True)
-
-        # 2) Run inference
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        
+        transform = transforms.Compose([
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        
+        img_tensor = transform(image).unsqueeze(0).to(self.device)
         self.model.eval()
-        all_preds, all_labels, all_paths, all_gens = [], [], [], []
         with torch.no_grad(), autocast():
-            for imgs, labels, paths, gens in loader:
-                imgs = imgs.to(self.device)
-                logits = self.model(imgs)
-                preds = logits.argmax(dim=1).cpu().numpy()
-
-                all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
-                all_paths.extend(paths)
-                all_gens.extend(gens)
-
-        # 3) Save predictions CSV
-        df_preds = pd.DataFrame({
-            "filepath":   all_paths,
-            "true_label": all_labels,
-            "pred_label": all_preds,
-            "generator":  all_gens
-        })
-        df_preds.to_csv(os.path.join(save_path, "predictions.csv"), index=False)
-
-        # 4) Classification report
-        report_str = classification_report(all_labels, all_preds, digits=4)
-        with open(os.path.join(save_path, "classification_report.txt"), "w") as f:
-            f.write(report_str)
-
-        # 5) Overall confusion matrix (true vs. pred)
-        cm = confusion_matrix(all_labels, all_preds)
-        dataset    = getattr(loader, "dataset", None)
-        class_names = getattr(dataset, "classes", None)
-
-        fig, ax = plt.subplots()
-        im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-        plt.colorbar(im, ax=ax)
-        if class_names is not None:
-            ax.set(
-                xticks=np.arange(len(class_names)),
-                yticks=np.arange(len(class_names)),
-                xticklabels=class_names,
-                yticklabels=class_names,
-                xlabel="Predicted label",
-                ylabel="True label",
-                title="Confusion Matrix"
-            )
-            plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-        else:
-            ax.set(xlabel="Predicted label", ylabel="True label", title="Confusion Matrix")
-
-        thresh = cm.max() / 2.0
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                ax.text(j, i, cm[i, j], ha="center", va="center",
-                        color="white" if cm[i, j] > thresh else "black")
-        fig.tight_layout()
-        fig.savefig(os.path.join(save_path, "confusion_matrix.png"))
-        plt.close(fig)
-
-        # 6) Generator × Predicted-label matrix
-        #    Build a crosstab: rows = generators, columns = predicted labels
-        mapped_preds = ["real" if p == 0 else "fake" for p in all_preds]
-        df_gen = pd.DataFrame({
-            "generator":  all_gens,
-            "pred_label": mapped_preds
-        })
-
-        df_gen_matrix = pd.crosstab(df_gen["generator"], df_gen["pred_label"])
-
-        # Save CSV
-        df_gen_matrix.to_csv(os.path.join(save_path, "generator_prediction_matrix.csv"))
-
-        # Plot heatmap
-        fig, ax = plt.subplots()
-        im = ax.imshow(df_gen_matrix.values, interpolation="nearest", cmap=plt.cm.Oranges)
-        plt.colorbar(im, ax=ax)
-        ax.set(
-            xticks=np.arange(df_gen_matrix.shape[1]),
-            yticks=np.arange(df_gen_matrix.shape[0]),
-            xticklabels=df_gen_matrix.columns,
-            yticklabels=df_gen_matrix.index,
-            xlabel="Predicted label",
-            ylabel="Generator",
-            title="Generator vs. Predicted-Label"
-        )
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-
-        # Annotate counts
-        thresh2 = df_gen_matrix.values.max() / 2.0
-        for i in range(df_gen_matrix.shape[0]):
-            for j in range(df_gen_matrix.shape[1]):
-                count = df_gen_matrix.iat[i, j]
-                ax.text(j, i, count, ha="center", va="center",
-                        color="white" if count > thresh2 else "black")
-        fig.tight_layout()
-        fig.savefig(os.path.join(save_path, "generator_prediction_matrix.png"))
-        plt.close(fig)
-
-        return report_str, df_preds, df_gen_matrix
+            output = self.model(img_tensor)
+            pred = output.argmax(dim=1).item()
+        return pred

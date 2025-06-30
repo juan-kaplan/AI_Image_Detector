@@ -113,7 +113,7 @@ def run_model(model_params, data_params):
 def test_model(model_params, data_params, model_path, test_dataset_path, seasons_only=False, topk=None):
     model, names = load_model(model_params)
     save_path = create_result_folder(model_params, data_params)
-    if isinstance(model, resnext_real_vs_ai.ResNeXtRealVsAITrainer):
+    if isinstance(model, resnext_real_vs_ai.ResNeXtRealVsAI):
         # Prepare dataloader using the new method
         test_loader = model.create_dataloader(
             names,
@@ -126,27 +126,9 @@ def test_model(model_params, data_params, model_path, test_dataset_path, seasons
         model.load_weights(model_path)
         model.evaluate(test_loader, save_path=save_path)
         pass
-    else:
-        model.load_params_model(model_path, names)
-        model.test_model(test_dataset_path, seasons_only=seasons_only, topk=topk)
 
-    # df = pd.read_csv(test_dataset_path)
-    # counter_correct_pred = 0
-    # for i, img in df.iterrows():
-    #     result = model.predict_season(img.to_frame().T)
-    #     if 'error' in result:
-    #         print(f"Error: {result['error']}")
-    #     else:
-    #         print(f"Real Season: {img['season']}")
-    #         print(f"Predicted Season: {result['predicted_season']}")
-    #         print("\nConfidence Scores:")
-    #         for season, prob in result['confidence_scores'].items():
-    #             print(f"{season}: {prob:.2%}")
-
-    #         if result['predicted_season'] == img['season']:
-    #             counter_correct_pred += 1
-
-    #         print('\n------------------------- \n')
-    
-    # print(f"\n\nCantidad de predicciones correctas: {counter_correct_pred}")
-
+def test_single_image(model_params, data_params, model_path, img_path):
+    model, names = load_model(model_params)
+    model.load_model_for_inference(model_path)
+    prediction = model.predict_image(img_path)
+    print(f"Image predicted as: {prediction}")
