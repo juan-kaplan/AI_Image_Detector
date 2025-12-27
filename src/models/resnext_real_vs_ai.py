@@ -14,37 +14,32 @@ import numpy as np
 
 
 class ImageCSVDataset(Dataset):
+    """
+    Custom Dataset class for loading images from a CSV file.
+
+    Expects a CSV with 'filepath' and 'label' columns.
+    """
     def __init__(self, classes, csv_path, img_dir=None, transform=None):
         self.df = pd.read_csv(csv_path)
         if "filepath" not in self.df.columns or "label" not in self.df.columns:
-            raise ValueError("El CSV debe tener columnas 'filepath' y 'label'.")
+            raise ValueError("CSV must contain 'filepath' and 'label' columns.")
         self.img_dir    = img_dir or ""
         self.transform  = transform
         self.label_map  = {cls: idx for idx, cls in enumerate(classes)}
         # keep the original class names for confusion matrix plotting
         self.classes    = list(classes)
 
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row   = self.df.iloc[idx]
-
-        path  = row["filepath"]
-
-        image = Image.open(path).convert("RGB")
-        label = self.label_map[row["label"]]
-        generator = row['generator']
-
-        if self.transform:
-                image = self.transform(image)
-        return image, label, path, generator
-
 
 class ResNeXtRealVsAI:
     """
-    Fine-tunes ResNeXt-50 32×4d for 2-class 'real vs AI' detection,
-    letting the caller select which backbone layers stay frozen.
+    ResNeXt-based model for Binary Classification (Real vs AI).
+
+    This class handles:
+    - Model creation (ResNeXt-50/101 backbone)
+    - Freezing/Unfreezing layers
+    - Training loop (fit)
+    - Validation
+    - Inference (evaluate)
     """
 
     def __init__(self, model_params: dict | None = None):

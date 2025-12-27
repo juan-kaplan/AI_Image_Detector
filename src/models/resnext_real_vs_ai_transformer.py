@@ -138,6 +138,7 @@ class ResNeXtRealVsAITransformer:
         self.attention_heads   = 8
         self.mlp_expansion_factor = 4
         self.ckpt_path = "runs/model_resnext_real_vs_ai_transformer.pt"
+        self.load_ckpt_seed = None
         
         # ------------------ overrides from dict -------------------------
         if model_params:
